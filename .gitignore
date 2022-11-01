@@ -130,3 +130,4 @@ dmypy.json
 
 *.csv
 crawl.py
+.DS_Store

@@ -12,6 +12,8 @@ import scrapy
 
 
 DOMAIN = "www.landwatch.com"
+
+LISTING_LINKS_FILE = pathlib.Path('listing_links.csv')
 BROKER_LINKS_FILE = pathlib.Path('broker_links.csv')
 BROKER_DETAILS_FILE = pathlib.Path('broker_details.csv')
 PROPERTY_LINKS_FILE = pathlib.Path('property_links.csv')
@@ -23,15 +25,16 @@ STATUSES = {
     3: "Off Market",
     4: "Sold",
 }
+
 ADDRESS_FIELDS = ['address1', 'address2', 'city', 'state', 'zip']
 
 
-def _script_string_to_json_prep(script_string: str, link: str):
+def _script_string_to_json_prep(script_string: str, page_url: str):
     prep = re.findall('window.serverState = "(.*)";', script_string)
     if not prep:
         logging.warning(
             "Can not find 'window.serverState' inside passed script text at the page %s.",
-            link
+            page_url
         )
         return None
     prep = prep[0]
@@ -41,6 +44,79 @@ def _script_string_to_json_prep(script_string: str, link: str):
     prep = re.sub(r'(encodedBoundaryPoints":)(".*?")', r'\1""', prep)
     prep = prep.replace('"{', '{').replace('}"', '}')
     return prep
+
+
+class ListingPagesSpider(scrapy.Spider):
+    """Spider which collects start urls for LandsForSaleSpider.
+
+    """
+    name = "listing-pages-spider"
+    domain = DOMAIN
+    allowed_domains = [domain]
+    filter_order = {
+        "Region": "County",
+        "County": "City",
+        "City": "Price",
+    }
+    custom_settings = {
+        'FEEDS': {
+            LISTING_LINKS_FILE: {
+                'format': 'csv',
+                'overwrite': True,
+                'fields': ['start_link', 'count', 'root_page'],
+            }
+        }
+    }
+    start_urls = ['https://www.landwatch.com/land']
+
+    def parse(self, response, **kwargs):
+        state_urls = response.css('a.e6625').xpath('@href').getall()
+        for state_url in state_urls:
+            yield scrapy.Request(
+                url=f'https://{self.domain}{state_url}',
+                callback=self.parse_page,
+                meta={'filter_section_name': 'Region'}
+            )
+
+    def parse_page(self, response):
+        page_url = response.url
+        filter_section_name = response.meta['filter_section_name']
+        next_filter_section_name = self.filter_order.get(filter_section_name)
+        script_text = response.xpath(
+            '//script[contains(text(), "filterSections")]/text()').get()
+        page_data_prep = _script_string_to_json_prep(script_text, page_url)
+        try:
+            filter_section = re.findall(
+                r'"filterSections":(.*?),"footer"', page_data_prep)[0]
+            filters = json.loads(filter_section)
+        except (IndexError, ValueError):
+            logging.error(
+                "Something is wrong with 'window.serverState' content of broker page %s.",
+                page_url
+            )
+            filters = None
+        if not filters:
+            return
+        for filter_section in filters:
+            if filter_section.get("section") == filter_section_name:
+                region_filter = filter_section["filterLinks"]
+                for region in region_filter:
+                    if not region.get("count"):
+                        continue
+                    if region["count"] <= 10_000:
+                        yield {
+                            "start_link": region["relativeUrlPath"],
+                            "count": region["count"],
+                            "root_page": response.url,
+                        }
+                    else:
+                        if next_filter_section_name:
+                            yield scrapy.Request(
+                                url=f'https://{self.domain}{region["relativeUrlPath"]}',
+                                callback=self.parse_page,
+                                meta={'filter_section_name': next_filter_section_name}
+                            )
+                break
 
 
 class LandsForSaleSpider(scrapy.Spider):
@@ -55,37 +131,25 @@ class LandsForSaleSpider(scrapy.Spider):
             BROKER_LINKS_FILE: {
                 'format': 'csv',
                 'overwrite': True,
-                'fields': ['profile_link'],
+                'fields': ['profile_link', 'root_page'],
             },
             PROPERTY_LINKS_FILE: {
                 'format': 'csv',
                 'overwrite': True,
-                'fields': ['link'],
+                'fields': ['link', 'root_page'],
             },
         }
     }
 
     def start_requests(self):
-        urls = [
-            'https://www.landwatch.com/land',
-            'https://www.landwatch.com/farms-ranches',
-            'https://www.landwatch.com/hunting-property',
-            'https://www.landwatch.com/homesites',
-            'https://www.landwatch.com/homes',
-            'https://www.landwatch.com/undeveloped-land',
-            'https://www.landwatch.com/waterfront-property',
-            'https://www.landwatch.com/lakefront-property',
-            'https://www.landwatch.com/commercial-property',
-            'https://www.landwatch.com/recreational-property',
-            'https://www.landwatch.com/land/owner-financing',
-            'https://www.landwatch.com/timberland-property',
-            'https://www.landwatch.com/horse-property',
-            'https://www.landwatch.com/riverfront-property',
-            'https://www.landwatch.com/land/auctions',
-            'https://www.landwatch.com/oceanfront-property',
-        ]
-        for url in urls:
-            yield scrapy.Request(url, callback=self.parse)
+        with open(LISTING_LINKS_FILE, 'r', encoding='utf-8') as links_file:
+            for index, row in enumerate(links_file):
+                if index == 0:
+                    continue
+                row = row.replace("\n", "")
+                if row:
+                    url = row.split(',')[0]
+                    yield scrapy.Request(f'https://{self.domain}{url}', callback=self.parse)
 
     def parse(self, response, **kwargs):
         item_containers = response.css('div._51c43')
@@ -93,19 +157,44 @@ class LandsForSaleSpider(scrapy.Spider):
             yield {
                 "link": item_container.css('div._12a2b').xpath('a/@href').get(),
                 "profile_link": item_container.css('div.dc7c2').xpath('a/@href').get(),
+                "root_page": response.url,
             }
         next_page_url = response.css('a.d72c6:last-child').xpath('@href').get()
         if next_page_url is not None:
-            yield scrapy.Request(url=f'https://{self.domain}/{next_page_url}')
+            yield scrapy.Request(url=f'https://{self.domain}{next_page_url}')
 
 
-class BrokerProfileSpider(scrapy.Spider):
+class BaseDetailsSpider(scrapy.Spider):
+    """The spider which is used as a base for collecting broker and property details.
+
+    """
+    domain = DOMAIN
+    allowed_domains = [domain]
+    links_file = None
+
+    def start_requests(self):
+        with open(self.links_file, 'r', encoding='utf-8') as links_file:
+            for index, row in enumerate(links_file):
+                if index == 0:
+                    continue
+                row = row.replace("\n", "")
+                if row:
+                    url = row.split(',')[0]
+                    yield scrapy.Request(f'https://{self.domain}{url}', callback=self.parse)
+
+    def parse(self, response, **kwargs):
+        """Implementation of 'parse' method should be specified in its child class.
+
+        """
+        raise NotImplementedError(f'{self.__class__.__name__}.parse callback is not defined')
+
+
+class BrokerProfileSpider(BaseDetailsSpider):
     """Spider which collects broker profile details.
 
     """
     name = "broker-details-spider"
-    domain = DOMAIN
-    allowed_domains = [domain]
+    links_file = BROKER_LINKS_FILE
     address_fields = dict(zip(
         ADDRESS_FIELDS,
         ['companyAddress1', 'companyAddress2', 'companyCity', 'companyState', 'companyZip']
@@ -123,23 +212,14 @@ class BrokerProfileSpider(scrapy.Spider):
         }
     }
 
-    def start_requests(self):
-        with open(BROKER_LINKS_FILE, 'r', encoding='utf-8') as links_file:
-            for index, link in enumerate(links_file):
-                if index == 0:
-                    continue
-                link = link.replace("\n", "")
-                if link:
-                    yield scrapy.Request(f'https://{self.domain}{link}', callback=self.parse)
-
     def parse(self, response, **kwargs):
-        link = response.url
+        page_url = response.url
         item = {
-            'link': link,
+            'link': page_url,
         }
         script_text = response.xpath(
             '//script[contains(text(), "brokerDetails")]/text()').get()
-        page_data_prep = _script_string_to_json_prep(script_text, link)
+        page_data_prep = _script_string_to_json_prep(script_text, page_url)
         try:
             broker_details = re.findall(
                 r'"breadCrumbSchema":.+?,"brokerDetails":(.*),"carouselCounts"', page_data_prep)[0]
@@ -163,18 +243,17 @@ class BrokerProfileSpider(scrapy.Spider):
         except (IndexError, ValueError):
             logging.error(
                 "Something is wrong with 'window.serverState' content of broker page %s.",
-                link
+                page_url
             )
         yield item
 
 
-class PropertyDetailsSpider(scrapy.Spider):
+class PropertyDetailsSpider(BaseDetailsSpider):
     """Spider which collects property details.
 
     """
     name = "property-details-spider"
-    domain = DOMAIN
-    allowed_domains = [domain]
+    links_file = PROPERTY_LINKS_FILE
     address_fields = dict(zip(
         ADDRESS_FIELDS,
         ['address1', 'address2', 'city', 'stateAbbreviation', 'zip']
@@ -184,7 +263,7 @@ class PropertyDetailsSpider(scrapy.Spider):
         'FEEDS': {
             PROPERTY_DETAILS_FILE: {
                 'format': 'csv',
-                'overwrite': True,
+                'overwrite': False,
                 'fields': [
                     'link', 'brokerLink', 'status', 'title', 'price', 'acres',
                 ] + ADDRESS_FIELDS + home_fields + [
@@ -194,24 +273,15 @@ class PropertyDetailsSpider(scrapy.Spider):
         }
     }
 
-    def start_requests(self):
-        with open(PROPERTY_LINKS_FILE, 'r', encoding='utf-8') as links_file:
-            for index, link in enumerate(links_file):
-                if index == 0:
-                    continue
-                link = link.replace("\n", "")
-                if link:
-                    yield scrapy.Request(f'https://{self.domain}{link}', callback=self.parse)
-
     def parse(self, response, **kwargs):
-        link = response.url
+        page_url = response.url
         item = {
-            'link': link,
+            'link': page_url,
             'brokerLink': response.css('a.d51ec').xpath('@href').get(),
         }
         script_text = response.xpath(
             '//script[contains(text(), "propertyDetailPage")]/text()').get()
-        page_data_prep = _script_string_to_json_prep(script_text, link)
+        page_data_prep = _script_string_to_json_prep(script_text, page_url)
         try:
             property_details = re.findall(
                 r'"propertyData":(.*),"propertyEvents"', page_data_prep)[0]
@@ -241,6 +311,6 @@ class PropertyDetailsSpider(scrapy.Spider):
         except (IndexError, ValueError):
             logging.error(
                 "Something is wrong with 'window.serverState' content of property page %s.",
-                link
+                page_url
             )
         yield item

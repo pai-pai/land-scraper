@@ -12,3 +12,6 @@
 
 ### Collected broker details data
 <img src="https://pai-pai-github-images.s3.amazonaws.com/land-scraper-broker-details.png" height="75%" width="75%" alt="Collected broker details data" />
+
+## Technology stack
+- Scrapy
